@@ -6,7 +6,7 @@ import random
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -33,12 +33,12 @@ RP = {
     'lofis': ('разложить', 'разложил(а) на столе', '🪑'),
     'castrate': ('кастрировать', 'кастрировал(а)', '✂️'),
     'hit': ('ударить', 'ударил', '👊'),
-    'shlep': ('шлеп', 'шлепнул(а)',  '✋🏻'),
-     'kiss': ('засосать', 'засосал(а)', '💋'),
-     'spit': ('плюнуть', 'плюнул(а) в', '😗'),
-     'murder': ('убить', 'убил(а)', '🔪'),
-     'burn': ('сжечь', 'сжёг', '🔥'),
-     'punch': ('пнуть', 'пнул(а)', '👟'),
+    'shlep': ('шлеп', 'шлепнул(а)', '✋🏻'),
+    'kiss': ('засосать', 'засосал(а)', '💋'),
+    'spit': ('плюнуть', 'плюнул(а) в', '😗'),
+    'murder': ('убить', 'убил(а)', '🔪'),
+    'burn': ('сжечь', 'сжёг', '🔥'),
+    'punch': ('пнуть', 'пнул(а)', '👟'),
 }
 
 ALIASES = {v[0]: k for k, v in RP.items()}
@@ -59,6 +59,11 @@ RUSSIAN_COMMANDS = {
     'помощь', 'команды', 'что ты умеешь',
     'профиль', 'мой профиль',
     'топ', 'рейтинг', 'топ чата', 'рейтинг чата',
+    'топ день', 'топ за день',
+    'топ неделя', 'топ за неделю',
+    'топ месяц', 'топ за месяц',
+    'топ вся', 'топ всё время', 'топ за всё время',
+    'стата', 'статистика',
     'правила', 'правила чата',
     'монетка', 'орёл или решка', 'орел или решка',
     'бросить кубик', 'кубик', 'брось кубик',
@@ -101,6 +106,8 @@ HELP = """🎭 <b>Круг — команды</b>
 <b>Общение и рейтинг:</b>
 /profile — свой профиль; ответом — чужой
 /top — топ-10 по опыту в чате
+«топ день», «топ неделя», «топ месяц», «топ вся» — рейтинг по сообщениям
+«стата» или «статистика» — ваша статистика сообщений
 /rep — +1 к репутации ответом, одному участнику раз в сутки
 /dice — кубик; /coin — монетка
 /rp_off — запретить РП в свой адрес в этом чате
@@ -167,6 +174,14 @@ class Store:
             PRIMARY KEY(chat, giver, receiver, day)
         );
 
+        CREATE TABLE IF NOT EXISTS message_counts (
+            chat INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chat, uid, day)
+        );
+
         CREATE TABLE IF NOT EXISTS marriages (
             chat INTEGER NOT NULL,
             user1 INTEGER NOT NULL,
@@ -220,19 +235,70 @@ class Store:
 
     def get(self, chat, uid):
         return self.db.execute(
-            'SELECT * FROM profiles WHERE chat=? AND uid=?', (chat, uid)
+            'SELECT * FROM profiles WHERE chat=? AND uid=?',
+            (chat, uid),
         ).fetchone()
 
     def activity(self, chat, uid, name, now):
         row = self.user(chat, uid, name)
-        if now - row['last_xp'] >= 60:
-            with self.db:
+        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+
+        with self.db:
+            self.db.execute(
+                'INSERT INTO message_counts(chat,uid,day,count) VALUES(?,?,?,1) '
+                'ON CONFLICT(chat,uid,day) DO UPDATE SET count=count+1',
+                (chat, uid, day),
+            )
+
+            if now - row['last_xp'] >= 60:
                 self.db.execute(
                     'UPDATE profiles SET xp=xp+5,last_xp=? WHERE chat=? AND uid=?',
                     (now, chat, uid),
                 )
-            return True
-        return False
+
+        return True
+
+    def message_top(self, chat, start_day=None):
+        if start_day is None:
+            return self.db.execute(
+                'SELECT p.uid,p.name,COALESCE(SUM(m.count),0) AS messages '
+                'FROM profiles p LEFT JOIN message_counts m '
+                'ON m.chat=p.chat AND m.uid=p.uid '
+                'WHERE p.chat=? GROUP BY p.uid ORDER BY messages DESC,p.name LIMIT 10',
+                (chat,),
+            ).fetchall()
+
+        return self.db.execute(
+            'SELECT p.uid,p.name,COALESCE(SUM(m.count),0) AS messages '
+            'FROM profiles p LEFT JOIN message_counts m '
+            'ON m.chat=p.chat AND m.uid=p.uid AND m.day>=? '
+            'WHERE p.chat=? GROUP BY p.uid ORDER BY messages DESC,p.name LIMIT 10',
+            (start_day, chat),
+        ).fetchall()
+
+    def message_count(self, chat, uid, start_day=None):
+        if start_day is None:
+            row = self.db.execute(
+                'SELECT COALESCE(SUM(count),0) AS total '
+                'FROM message_counts WHERE chat=? AND uid=?',
+                (chat, uid),
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                'SELECT COALESCE(SUM(count),0) AS total '
+                'FROM message_counts WHERE chat=? AND uid=? AND day>=?',
+                (chat, uid, start_day),
+            ).fetchone()
+        return row['total']
+
+    def activity_stats(self, chat):
+        row = self.db.execute(
+            'SELECT COALESCE(SUM(count),0) AS total, '
+            'COUNT(DISTINCT uid) AS users '
+            'FROM message_counts WHERE chat=?',
+            (chat,),
+        ).fetchone()
+        return row
 
     def allow_rp(self, chat, uid, value):
         with self.db:
@@ -454,9 +520,9 @@ async def privacy(update, context):
         update,
         '<b>Данные бота</b>\n'
         'В SQLite на компьютере владельца сохраняются ID чата и участников, '
-        'отображаемое имя, опыт, репутация, предупреждения, согласие на РП, '
-        'сведения о браках и настройки группы. Для ограничения начислений '
-        'хранятся время последнего опыта и дневные записи репутации. '
+        'отображаемое имя, опыт, репутация, число сообщений, предупреждения, '
+        'согласие на РП, сведения о браках и настройки группы. Для ограничения '
+        'начислений хранятся время последнего опыта и дневные записи репутации. '
         'Тексты переписки и причины модерации в базу не записываются.\n\n'
         '/rp_off отключает РП в ваш адрес в текущем чате. Для удаления '
         'данных обратитесь к оператору бота. Удаление всей базы при '
@@ -713,12 +779,16 @@ async def profile(update, context):
     )
     level, progress = divmod(row['xp'], 100)
     status = 'разрешены' if row['rp_allowed'] else 'отключены'
+    total_messages = db(context).message_count(
+        update.effective_chat.id, user.id
+    )
 
     await say(
         update,
         f'👤 <b>Профиль</b> {mention(user)}\n'
         f'Уровень: <b>{level + 1}</b>\n'
         f'Опыт: {row["xp"]} · до следующего уровня: {100 - progress}\n'
+        f'Сообщения: {total_messages}\n'
         f'Репутация: {row["rep"]}\n'
         f'Предупреждения: {row["warns"]}\n'
         f'РП в ваш адрес: {status}\n\n'
@@ -739,8 +809,94 @@ async def top(update, context):
     )
     await say(
         update,
-        '🏆 <b>Топ этого чата</b>\n'
+        '🏆 <b>Топ этого чата по опыту</b>\n'
         + (text or 'Пока пусто. Пора начинать общение!'),
+    )
+
+
+def period_start(period):
+    today = datetime.now(timezone.utc).date()
+    if period == 'day':
+        start = today
+    elif period == 'week':
+        start = today - timedelta(days=today.weekday())
+    elif period == 'month':
+        start = today.replace(day=1)
+    else:
+        return None
+    return start.isoformat()
+
+
+async def message_top(update, period):
+    if not await group_only(update):
+        return
+
+    titles = {
+        'day': 'сегодня',
+        'week': 'за неделю',
+        'month': 'за месяц',
+        'all': 'за всё время',
+    }
+    start_day = period_start(period) if period != 'all' else None
+    rows = db(update.get_bot_data_context()).message_top(
+        update.effective_chat.id, start_day
+    )
+    lines = [
+        f'{i}. {esc(row["name"])} — {row["messages"]} сообщ.'
+        for i, row in enumerate(rows, 1)
+    ]
+    await say(
+        update,
+        f'💬 <b>Топ сообщений {titles[period]}</b>\n'
+        + ('\n'.join(lines) if lines else 'Пока сообщений нет.'),
+    )
+
+
+async def message_top_handler(update, context, period):
+    if not await group_only(update):
+        return
+
+    titles = {
+        'day': 'сегодня',
+        'week': 'за неделю',
+        'month': 'за месяц',
+        'all': 'за всё время',
+    }
+    start_day = period_start(period) if period != 'all' else None
+    rows = db(context).message_top(update.effective_chat.id, start_day)
+    lines = [
+        f'{i}. {esc(row["name"])} — {row["messages"]} сообщ.'
+        for i, row in enumerate(rows, 1)
+    ]
+    await say(
+        update,
+        f'💬 <b>Топ сообщений {titles[period]}</b>\n'
+        + ('\n'.join(lines) if lines else 'Пока сообщений нет.'),
+    )
+
+
+async def statistics(update, context):
+    if not await group_only(update):
+        return
+
+    cid = update.effective_chat.id
+    user = update.effective_user
+    store = db(context)
+    total = store.message_count(cid, user.id)
+    today = store.message_count(cid, user.id, period_start('day'))
+    week = store.message_count(cid, user.id, period_start('week'))
+    month = store.message_count(cid, user.id, period_start('month'))
+    chat_stats = store.activity_stats(cid)
+
+    await say(
+        update,
+        f'📊 <b>Статистика {mention(user)}</b>\n'
+        f'Сообщений за сегодня: <b>{today}</b>\n'
+        f'За неделю: <b>{week}</b>\n'
+        f'За месяц: <b>{month}</b>\n'
+        f'Всего: <b>{total}</b>\n\n'
+        f'В чате учтено сообщений: <b>{chat_stats["total"]}</b>\n'
+        f'Участников с сообщениями: <b>{chat_stats["users"]}</b>',
     )
 
 
@@ -1036,6 +1192,26 @@ async def text_message(update, context):
         await top(update, context)
         return
 
+    if text in {'топ день', 'топ за день'}:
+        await message_top_handler(update, context, 'day')
+        return
+
+    if text in {'топ неделя', 'топ за неделю'}:
+        await message_top_handler(update, context, 'week')
+        return
+
+    if text in {'топ месяц', 'топ за месяц'}:
+        await message_top_handler(update, context, 'month')
+        return
+
+    if text in {'топ вся', 'топ всё время', 'топ за всё время'}:
+        await message_top_handler(update, context, 'all')
+        return
+
+    if text in {'стата', 'статистика'}:
+        await statistics(update, context)
+        return
+
     if text in {'правила', 'правила чата'}:
         await rules(update, context)
         return
@@ -1114,7 +1290,7 @@ async def migrated(update, context):
 
     with store.db:
         for table in (
-            'chats', 'profiles', 'reputation',
+            'chats', 'profiles', 'reputation', 'message_counts',
             'marriages', 'marriage_proposals',
         ):
             store.db.execute(
@@ -1182,7 +1358,7 @@ async def post_init(application):
         BotCommand('help', 'Команды бота'),
         BotCommand('profile', 'Профиль участника'),
         BotCommand('hug', 'Обнять — ответом'),
-        BotCommand('top', 'Рейтинг чата'),
+        BotCommand('top', 'Рейтинг чата по опыту'),
         BotCommand('rules', 'Правила чата'),
         BotCommand('privacy', 'Данные и приватность'),
     ])
